@@ -6,13 +6,14 @@ from __future__ import print_function
 import copy
 import logging
 import math
-
+import os
 from os.path import join as pjoin
 
 import torch
 import torch.nn as nn
 import numpy as np
 
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
@@ -162,8 +163,10 @@ class Embeddings(nn.Module):
         x = x.flatten(2)
         x = x.transpose(-1, -2)
         x = torch.cat((cls_tokens, x), dim=1)
-
+        # print(x.size())
+        # print(self.position_embeddings.size())
         embeddings = x + self.position_embeddings
+        # print(embeddings.size())
         embeddings = self.dropout(embeddings)
         return embeddings
 
@@ -228,10 +231,13 @@ class Block(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, embedding_layer, embedding_use_cls_token):
         super(Encoder, self).__init__()
+        assert config.transformer["num_layers"] >= embedding_layer, "Embedding layer needs to be valid"
         self.vis = vis
         self.layer = nn.ModuleList()
+        self.embedding_layer = embedding_layer
+        self.embedding_use_cls_token = embedding_use_cls_token
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
         for _ in range(config.transformer["num_layers"]):
             layer = Block(config, vis)
@@ -239,38 +245,50 @@ class Encoder(nn.Module):
 
     def forward(self, hidden_states):
         attn_weights = []
+        layer_index = 0
         for layer_block in self.layer:
             hidden_states, weights = layer_block(hidden_states)
             if self.vis:
                 attn_weights.append(weights)
+            # if self.embedding_layer - 1 == layer_index:
+            #     if self.embedding_use_cls_token:
+            #         image_embedding = hidden_states[:, 0]
+            #     else:
+            #         image_embedding = torch.mean(hidden_states, dim=2)
+            # layer_index += 1
         encoded = self.encoder_norm(hidden_states)
-        return encoded, attn_weights
+        return encoded, attn_weights#, image_embedding
 
 
 class Transformer(nn.Module):
-    def __init__(self, config, img_size, vis):
+    def __init__(self, config, img_size, vis, in_channels=3, embedding_layer=12, embedding_use_cls_token=True):
         super(Transformer, self).__init__()
-        self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config, vis)
+        self.embeddings = Embeddings(config, img_size=img_size, in_channels=in_channels)
+        self.encoder = Encoder(config, vis, embedding_layer, embedding_use_cls_token)
 
     def forward(self, input_ids):
         embedding_output = self.embeddings(input_ids)
+        # encoded, attn_weights, image_embedding = self.encoder(embedding_output)
         encoded, attn_weights = self.encoder(embedding_output)
-        return encoded, attn_weights
+        return encoded, attn_weights#, image_embedding
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, in_channels=3,
+            embedding_layer=12, embedding_use_cls_token=True):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.classifier = config.classifier
 
-        self.transformer = Transformer(config, img_size, vis)
+        self.transformer = Transformer(config, img_size, vis, in_channels=in_channels,
+            embedding_layer=embedding_layer, embedding_use_cls_token=embedding_use_cls_token)
         self.head = Linear(config.hidden_size, num_classes)
 
     def forward(self, x, labels=None):
         x, attn_weights = self.transformer(x)
+        #print(x.size())
+        #print(attn_weights)
         logits = self.head(x[:, 0])
 
         if labels is not None:
@@ -278,7 +296,25 @@ class VisionTransformer(nn.Module):
             loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
             return loss
         else:
-            return logits, attn_weights
+            return logits#, attn_weights, image_embedding
+
+    def load_from_checkpoint(self, checkpoint_path):
+        """Loads a checkpoint.
+
+        Args:
+            checkpoint_step (int): iteration of checkpoint to load
+
+        Raises:
+            ValueError: if checkpoint for checkpoint_step is not found
+        """
+        if os.path.isfile(checkpoint_path):
+            state = torch.load(checkpoint_path)
+            self.load_state_dict(state)
+            print(f'Loaded checkpoint file {checkpoint_path}.')
+        else:
+            raise ValueError(
+                f'Not a file'
+            )
 
     def load_from(self, weights):
         with torch.no_grad():
@@ -336,7 +372,239 @@ class VisionTransformer(nn.Module):
                         unit.load_from(weights, n_block=bname, n_unit=uname)
 
 
+class MultitaskVisionTransformer(nn.Module):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, in_channels=3,
+            embedding_layer=12, embedding_use_cls_token=True):
+        super(VisionTransformer, self).__init__()
+        self.num_classes = num_classes
+        self.zero_head = zero_head
+        self.classifier = config.classifier
+
+        self.transformer = Transformer(config, img_size, vis, in_channels=in_channels,
+            embedding_layer=embedding_layer, embedding_use_cls_token=embedding_use_cls_token)
+        self.head = Linear(config.hidden_size, num_classes)
+
+    def forward(self, x, labels=None):
+        x, attn_weights = self.transformer(x)
+        #print(x.size())
+        #print(attn_weights)
+        logits = self.head(x[:, 0])
+
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss
+        else:
+            return logits#, attn_weights, image_embedding
+
+    def load_from(self, weights):
+        with torch.no_grad():
+            if self.zero_head:
+                nn.init.zeros_(self.head.weight)
+                nn.init.zeros_(self.head.bias)
+            else:
+                self.head.weight.copy_(np2th(weights["head/kernel"]).t())
+                self.head.bias.copy_(np2th(weights["head/bias"]).t())
+
+            self.transformer.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+            self.transformer.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+            self.transformer.embeddings.cls_token.copy_(np2th(weights["cls"]))
+            self.transformer.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+            self.transformer.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+
+            posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
+            posemb_new = self.transformer.embeddings.position_embeddings
+            if posemb.size() == posemb_new.size():
+                self.transformer.embeddings.position_embeddings.copy_(posemb)
+            else:
+                logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+                ntok_new = posemb_new.size(1)
+
+                if self.classifier == "token":
+                    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                    ntok_new -= 1
+                else:
+                    posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+
+                gs_old = int(np.sqrt(len(posemb_grid)))
+                gs_new = int(np.sqrt(ntok_new))
+                print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+                posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+                zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+                posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+                posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+                self.transformer.embeddings.position_embeddings.copy_(np2th(posemb))
+
+            for bname, block in self.transformer.encoder.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=uname)
+
+            if self.transformer.embeddings.hybrid:
+                self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(np2th(weights["conv_root/kernel"], conv=True))
+                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
+                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
+                self.transformer.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
+                self.transformer.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
+
+                for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
+                    for uname, unit in block.named_children():
+                        unit.load_from(weights, n_block=bname, n_unit=uname)
+
+def conv_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        init.xavier_uniform_(m.weight, gain=np.sqrt(2))
+        init.constant_(m.bias, 0)
+    elif classname.find('BatchNorm') != -1:
+        init.constant_(m.weight, 1)
+        init.constant_(m.bias, 0)
+
+class wide_basic(nn.Module):
+    def __init__(self, in_planes, planes, dropout_rate, stride=1):
+        super(wide_basic, self).__init__()
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, padding=1, bias=True)
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=True)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=True),
+            )
+
+    def forward(self, x):
+        out = self.dropout(self.conv1(F.relu(self.bn1(x))))
+        out = self.conv2(F.relu(self.bn2(out)))
+        out += self.shortcut(x)
+
+        return out
+
+class Wide_ResNet(nn.Module):
+    def __init__(self, depth, widen_factor, dropout_rate, num_classes, in_channels=3):
+        super(Wide_ResNet, self).__init__()
+        self.in_planes = 16
+
+        assert ((depth-4)%6 ==0), 'Wide-resnet depth should be 6n+4'
+        n = (depth-4)/6
+        k = widen_factor
+
+        print('| Wide-Resnet %dx%d' %(depth, k))
+        nStages = [16, 16*k, 32*k, 64*k]
+
+        self.num_classes = num_classes
+
+        self.conv1 = nn.Conv2d(in_channels, nStages[0], kernel_size=3, stride=1, padding=1, bias=True)
+        self.layer1 = self._wide_layer(wide_basic, nStages[1], n, dropout_rate, stride=1)
+        self.layer2 = self._wide_layer(wide_basic, nStages[2], n, dropout_rate, stride=2)
+        self.layer3 = self._wide_layer(wide_basic, nStages[3], n, dropout_rate, stride=2)
+        self.bn1 = nn.BatchNorm2d(nStages[3], momentum=0.9)
+        self.linear = nn.Linear(nStages[3], num_classes)
+
+    def _wide_layer(self, block, planes, num_blocks, dropout_rate, stride):
+        strides = [stride] + [1]*(int(num_blocks)-1)
+        layers = []
+
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, dropout_rate, stride))
+            self.in_planes = planes
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x, labels=None):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.relu(self.bn1(out))
+        out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(out.view(-1, self.num_classes), labels.view(-1))
+            return loss
+        else:
+            return out
+
+    def load_from_checkpoint(self, checkpoint_path):
+        """Loads a checkpoint.
+
+        Args:
+            checkpoint_step (int): iteration of checkpoint to load
+
+        Raises:
+            ValueError: if checkpoint for checkpoint_step is not found
+        """
+        if os.path.isfile(checkpoint_path):
+            state = torch.load(checkpoint_path)
+            self.load_state_dict(state)
+            print(f'Loaded checkpoint file {checkpoint_path}.')
+        else:
+            raise ValueError(
+                f'Not a file'
+            )
+
+class MultitaskWideResNet(nn.Module):
+    def __init__(self, depth, widen_factor, dropout_rate, dataset_to_num_classes):
+        super(MultitaskWideResNet, self).__init__()
+        self.in_planes = 16
+
+        assert ((depth-4)%6 ==0), 'Wide-resnet depth should be 6n+4'
+        n = (depth-4)/6
+        k = widen_factor
+
+        print('| Wide-Resnet %dx%d' %(depth, k))
+        nStages = [16, 16*k, 32*k, 64*k]
+
+        self.num_classes = num_classes
+
+        self.conv1 = nn.Conv2d(3, nStages[0], kernel_size=3, stride=1, padding=1, bias=True)
+        self.layer1 = self._wide_layer(wide_basic, nStages[1], n, dropout_rate, stride=1)
+        self.layer2 = self._wide_layer(wide_basic, nStages[2], n, dropout_rate, stride=2)
+
+        self.layer3_heads = []
+        for dataset, num_classes in dataset_to_num_classes.items():
+            self.layer3_heads.append(self._wide_layer(wide_basic, nStages[3], n, dropout_rate, stride=2))
+
+        self.bn1 = nn.BatchNorm2d(nStages[3], momentum=0.9)
+        self.linear = nn.Linear(nStages[3], num_classes)
+
+    def _wide_layer(self, block, planes, num_blocks, dropout_rate, stride):
+        strides = [stride] + [1]*(int(num_blocks)-1)
+        layers = []
+
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, dropout_rate, stride))
+            self.in_planes = planes
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x, labels=None):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.relu(self.bn1(out))
+        out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(out.view(-1, self.num_classes), labels.view(-1))
+            return loss
+        else:
+            return out
+
+
 CONFIGS = {
+    'ViT-B_2': configs.get_b2_config(),
+    'ViT-B_4': configs.get_b4_config(),
     'ViT-B_16': configs.get_b16_config(),
     'ViT-B_32': configs.get_b32_config(),
     'ViT-L_16': configs.get_l16_config(),

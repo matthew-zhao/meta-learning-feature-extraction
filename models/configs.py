@@ -30,6 +30,21 @@ def get_testing():
     config.representation_size = None
     return config
 
+# for Omniglot, we have 28x28 images. In order to come up with the same
+# num of patches as Vision Transformer paper does on CIFAR (196),
+# we need the patch size to be 2x2  (instead of 16x16)
+def get_b2_config():
+    """Returns the ViT-B/2 configuration."""
+    config = get_b16_config()
+    config.patches.size = (2,2)
+    return config
+
+def get_b4_config():
+    """Return the ViT-B/4 configuration."""
+    config = get_b16_config()
+    config.patches.size = (4,4)
+    return config
+
 
 def get_b16_config():
     """Returns the ViT-B/16 configuration."""

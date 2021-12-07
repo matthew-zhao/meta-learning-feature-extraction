@@ -5,25 +5,29 @@ import logging
 import argparse
 import os
 import random
+import pickle
 import numpy as np
 
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
+# from apex import amp
+# from apex.parallel import DistributedDataParallel as DDP
 
-from models.modeling import VisionTransformer, CONFIGS
+from models.modeling import VisionTransformer, CONFIGS, Wide_ResNet
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader
 from utils.dist_util import get_world_size
 
 
 logger = logging.getLogger(__name__)
+
+features = {}
 
 
 class AverageMeter(object):
@@ -59,18 +63,23 @@ def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type]
 
-    num_classes = 10 if args.dataset == "cifar10" else 100
-
-    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
-    model.load_from(np.load(args.pretrained_dir))
-    model.to(args.device)
+    if args.network == 'ViT':
+        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=args.num_classes, in_channels=args.in_channels,
+            embedding_layer=args.embedding_layer, embedding_use_cls_token=args.embedding_use_cls_token)
+    else:
+        model = Wide_ResNet(28, 10, 0.5, num_classes=args.num_classes, in_channels=args.in_channels)
+    if args.pretrained_dir:
+        model.load_from(np.load(args.pretrained_dir))
+    if args.checkpoint_dir:
+        model.load_from_checkpoint(args.checkpoint_dir)
+    print(model.to(args.device))
     num_params = count_parameters(model)
 
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
     logger.info("Total Parameter: \t%2.1fM" % num_params)
     print(num_params)
-    return args, model
+    return args, model, config
 
 
 def count_parameters(model):
@@ -86,29 +95,100 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, test_loader, global_step):
-    # Validation!
+def test(args, model, features):
+    train_loader, valid_loader, test_loader = get_loader(args, test_on_train=True)
+    if args.mode == 'train':
+        loader = train_loader
+    elif args.mode == 'valid':
+        loader = valid_loader
+    else:
+        loader = test_loader
     eval_losses = AverageMeter()
 
-    logger.info("***** Running Validation *****")
+    logger.info("***** Running Testing *****")
     logger.info("  Num steps = %d", len(test_loader))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
+
+    all_preds = []
+    feats = []
+    embedding_keys = []
+    labels = []
+    
+    epoch_iterator = tqdm(loader,
+                          desc="Testing... (loss=X.X)",
+                          bar_format="{l_bar}{r_bar}",
+                          dynamic_ncols=True,
+                          disable=args.local_rank not in [-1, 0])
+
+    for step, batch in enumerate(epoch_iterator):
+        batch = tuple(t.to(args.device) if torch.is_tensor(t) else t for t in batch)
+        x, y, img_names = batch
+        with torch.no_grad():
+            logits = model(x)
+            preds = torch.argmax(logits, dim=-1)
+
+        if len(all_preds) == 0:
+            all_preds.append(preds.detach().cpu().numpy())
+        else:
+            all_preds[0] = np.append(
+                all_preds[0], preds.detach().cpu().numpy(), axis=0
+            )
+
+        if args.network == "ViT":
+            if args.embedding_use_cls_token:
+                image_embedding = features['feats'][:, 0]
+            else:
+                image_embedding = torch.mean(features['feats'], dim=2)
+        else:
+            conv_output = features['feats']
+            image_embedding = torch.mean(conv_output.view(conv_output.size(0), conv_output.size(1), -1), dim=2)
+
+        # conforming to LEO
+        feat_as_numpy = image_embedding.cpu().numpy()
+        feats.append(feat_as_numpy)
+        embedding_keys.append(img_names)
+        labels.append(y.cpu().numpy())
+
+    all_preds = all_preds[0]
+    feats = np.concatenate(feats)
+    embedding_keys = np.concatenate(embedding_keys)
+    labels = np.concatenate(labels)
+
+    logger.info("\n")
+    logger.info("Test Results")
+    return all_preds, {"embeddings": feats, "keys": embedding_keys, "labels": labels}
+
+
+def valid(args, model, writer, valid_loader, global_step):
+    # Validation!
+    eval_losses = AverageMeter()
+
+    logger.info("***** Running Validation *****")
+    logger.info("  Num steps = %d", len(valid_loader))
+    logger.info("  Batch size = %d", args.eval_batch_size)
+
+    model.eval()
     all_preds, all_label = [], []
-    epoch_iterator = tqdm(test_loader,
+    feats = []
+    embedding_keys = []
+    labels = []
+
+    epoch_iterator = tqdm(valid_loader,
                           desc="Validating... (loss=X.X)",
                           bar_format="{l_bar}{r_bar}",
                           dynamic_ncols=True,
                           disable=args.local_rank not in [-1, 0])
+
     loss_fct = torch.nn.CrossEntropyLoss()
     for step, batch in enumerate(epoch_iterator):
-        batch = tuple(t.to(args.device) for t in batch)
-        x, y = batch
+        batch = tuple(t.to(args.device) if torch.is_tensor(t) else t for t in batch)
+        x, y, img_names = batch
         with torch.no_grad():
-            logits = model(x)[0]
+            logits = model(x)
 
-            eval_loss = loss_fct(logits, y)
+            eval_loss = loss_fct(logits, y.squeeze())
             eval_losses.update(eval_loss.item())
 
             preds = torch.argmax(logits, dim=-1)
@@ -123,10 +203,29 @@ def valid(args, model, writer, test_loader, global_step):
             all_label[0] = np.append(
                 all_label[0], y.detach().cpu().numpy(), axis=0
             )
+
+        if args.network == "ViT":
+            if args.embedding_use_cls_token:
+                image_embedding = features['feats'][:, 0]
+            else:
+                image_embedding = torch.mean(features['feats'], dim=2)
+        else:
+            conv_output = features['feats']
+            image_embedding = torch.mean(conv_output.view(conv_output.size(0), conv_output.size(1), -1), dim=2)
+
+        # conforming to LEO
+        feat_as_numpy = image_embedding.cpu().numpy()
+        feats.append(feat_as_numpy)
+        embedding_keys.append(img_names)
+        labels.append(y.cpu().numpy())
+
         epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
 
     all_preds, all_label = all_preds[0], all_label[0]
-    accuracy = simple_accuracy(all_preds, all_label)
+    feats = np.concatenate(feats)
+    embedding_keys = np.concatenate(embedding_keys)
+    labels = np.concatenate(labels)
+    accuracy = simple_accuracy(all_preds, all_label.squeeze())
 
     logger.info("\n")
     logger.info("Validation Results")
@@ -135,10 +234,10 @@ def valid(args, model, writer, test_loader, global_step):
     logger.info("Valid Accuracy: %2.5f" % accuracy)
 
     writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
-    return accuracy
+    return accuracy, {"embeddings": feats, "keys": embedding_keys, "labels": labels}
 
 
-def train(args, model):
+def train(args, model, features):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -147,7 +246,7 @@ def train(args, model):
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
-    train_loader, test_loader = get_loader(args)
+    train_loader, valid_loader, test_loader = get_loader(args)
 
     # Prepare optimizer and scheduler
     optimizer = torch.optim.SGD(model.parameters(),
@@ -160,15 +259,15 @@ def train(args, model):
     else:
         scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    if args.fp16:
-        model, optimizer = amp.initialize(models=model,
-                                          optimizers=optimizer,
-                                          opt_level=args.fp16_opt_level)
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+    # if args.fp16:
+    #     model, optimizer = amp.initialize(models=model,
+    #                                       optimizers=optimizer,
+    #                                       opt_level=args.fp16_opt_level)
+    #     amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
     # Distributed training
-    if args.local_rank != -1:
-        model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+    # if args.local_rank != -1:
+    #     model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
 
     # Train!
     logger.info("***** Running training *****")
@@ -182,7 +281,7 @@ def train(args, model):
     model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
     losses = AverageMeter()
-    global_step, best_acc = 0, 0
+    global_step, best_acc = 0, -1
     while True:
         model.train()
         epoch_iterator = tqdm(train_loader,
@@ -191,24 +290,24 @@ def train(args, model):
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
-            batch = tuple(t.to(args.device) for t in batch)
-            x, y = batch
+            batch = tuple(t.to(args.device) if torch.is_tensor(t) else t for t in batch)
+            x, y, _ = batch
             loss = model(x, y)
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            # if args.fp16:
+            #     with amp.scale_loss(loss, optimizer) as scaled_loss:
+            #         scaled_loss.backward()
+            # else:
+            loss.backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 losses.update(loss.item()*args.gradient_accumulation_steps)
-                if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                # if args.fp16:
+                #     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                # else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
@@ -221,7 +320,7 @@ def train(args, model):
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy = valid(args, model, writer, test_loader, global_step)
+                    accuracy, valid_embedding_dict = valid(args, model, writer, valid_loader, global_step)
                     if best_acc < accuracy:
                         save_model(args, model)
                         best_acc = accuracy
@@ -235,29 +334,79 @@ def train(args, model):
 
     if args.local_rank in [-1, 0]:
         writer.close()
+
     logger.info("Best Accuracy: \t%f" % best_acc)
     logger.info("End Training!")
+    return valid_embedding_dict
 
+def get_features(name):
+    def hook(model, input, output):
+        if isinstance(output, tuple):
+            output = output[0]
+        features[name] = output.detach()
+    return hook
+
+def register_forward_hooks(args, config, model):
+    if args.network == "ViT":
+        if args.embedding_layer < config.transformer["num_layers"]:
+            model.transformer.encoder.layer[args.embedding_layer - 1].register_forward_hook(get_features('feats'))
+        elif args.embedding_layer == config.transformer["num_layers"]:
+            model.transformer.encoder.encoder_norm.register_forward_hook(get_features('feats'))
+        else:
+            raise ValueError("Embedding layer to extract embeddings from is invalid for this Vision Transformer")
+    else:
+        if args.embedding_layer < 2:
+            model.conv1.register_forward_hook(get_features('feats'))
+            return
+
+        wide_layer_num = (args.embedding_layer - 2) // 9
+        if wide_layer_num == 0:
+            prefix = model.layer1
+        elif wide_layer_num == 1:
+            prefix = model.layer2
+        elif wide_layer_num == 2:
+            prefix = model.layer3
+
+        inside_block_layer_num = (args.embedding_layer - 2) % 9
+        if inside_block_layer_num == 2:
+            prefix[0].shortcut[0].register_forward_hook(get_features('feats'))
+            return
+
+        if inside_block_layer_num > 2:
+            adjusted_inside_block_layer_num = inside_block_layer_num - 1
+        else:
+            adjusted_inside_block_layer_num = inside_block_layer_num
+
+        block_num = adjusted_inside_block_layer_num // 2
+        prefix = prefix[block_num]
+        if adjusted_inside_block_layer_num % 2 == 0:
+            prefix.conv1.register_forward_hook(get_features('feats'))
+        else:
+            prefix.conv2.register_forward_hook(get_features('feats'))
 
 def main():
     parser = argparse.ArgumentParser()
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
+    parser.add_argument("--mode", choices=["train", "valid", "test", "trainembeddings"], default="train", help="Train, valid or Test")
+    parser.add_argument("--dataset", choices=["omniglot", "miniimagenet", "tieredimagenet", "aircraft"], default="omniglot",
                         help="Which downstream task.")
-    parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
+    parser.add_argument('--network', choices=["ViT", "WRN"], default="ViT", help="Which model to use. WRN is always 28-10 for simplicity")
+    parser.add_argument("--model_type", choices=["ViT-B_2", "ViT-B_4", "ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
                         help="Which variant to use.")
-    parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
+    parser.add_argument("--pretrained_dir", type=str, default="",
                         help="Where to search for pretrained ViT models.")
+    parser.add_argument("--checkpoint_dir", type=str, default="",
+                        help="Load/train/test a checkpointed model.")
     parser.add_argument("--output_dir", default="output", type=str,
                         help="The output directory where checkpoints will be written.")
 
     parser.add_argument("--img_size", default=224, type=int,
                         help="Resolution size")
-    parser.add_argument("--train_batch_size", default=512, type=int,
+    parser.add_argument("--train_batch_size", default=64, type=int,
                         help="Total batch size for training.")
     parser.add_argument("--eval_batch_size", default=64, type=int,
                         help="Total batch size for eval.")
@@ -284,16 +433,29 @@ def main():
                         help="random seed for initialization")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
-    parser.add_argument('--fp16_opt_level', type=str, default='O2',
-                        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
-                             "See details at https://nvidia.github.io/apex/amp.html")
-    parser.add_argument('--loss_scale', type=float, default=0,
-                        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-                             "0 (default value): dynamic loss scaling.\n"
-                             "Positive power of 2: static loss scaling value.\n")
+    parser.add_argument('--in_channels', type=int, default=3,
+                        help="Number of channels")
+    parser.add_argument('--num_classes', type=int, default=1623,
+                        help="Number of classes")
+    parser.add_argument('--embedding_layer', type=int, default=12,
+                        help="layer of transformer block to draw embedding from")
+    parser.add_argument('--embedding_use_cls_token', action='store_true', default=False)
+    parser.add_argument('--augment_mini_imagenet', action='store_true', default=False)
+    parser.add_argument('--meta_dataset_path', type=str, default="../meta-dataset/")
+    parser.add_argument('--train_transforms', type=list, default=["resize", "to_tensor"])
+    parser.add_argument('--test_transforms', type=list, default=["resize", "to_tensor"])
+    # parser.add_argument('--fp16', action='store_true',
+    #                     help="Whether to use 16-bit float precision instead of 32-bit")
+    # parser.add_argument('--fp16_opt_level', type=str, default='O2',
+    #                     help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
+    #                          "See details at https://nvidia.github.io/apex/amp.html")
+    # parser.add_argument('--loss_scale', type=float, default=0,
+    #                     help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
+    #                          "0 (default value): dynamic loss scaling.\n"
+    #                          "Positive power of 2: static loss scaling value.\n")
     args = parser.parse_args()
+
+    torch.cuda.empty_cache()
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:
@@ -311,17 +473,29 @@ def main():
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
-                   (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
+    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s" %
+                   (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1)))
 
     # Set seed
     set_seed(args)
 
     # Model & Tokenizer Setup
-    args, model = setup(args)
+    args, model, config = setup(args)
 
-    # Training
-    train(args, model)
+    register_forward_hooks(args, config, model)
+
+    if args.mode == 'train':
+        # Training
+        valid_embeddings = train(args, model, features)
+        # create dict with keys to use in LEO code
+        with open(os.path.join(args.output_dir, "%s_%s_valid_embeddings.pickle" % (args.dataset, args.network)), 'wb') as f:
+            pickle.dump(valid_embeddings, f)
+    else:
+        args.mode = args.mode if args.mode != 'trainembeddings' else 'train'
+        all_preds, test_embeddings = test(args, model, features)
+        with open(os.path.join(args.output_dir, "%s_%s_%s_embeddings.pickle" % (args.dataset, args.network, args.mode)), 'wb') as f:
+            pickle.dump(test_embeddings, f)
+
 
 
 if __name__ == "__main__":
